@@ -14,7 +14,7 @@ Timestamp parsing is pure stdlib (re + datetime) — compatible with Pyodide.
 Audio header reading uses struct for WAV (stdlib) and soundfile for FLAC/AIF.
 
 Usage (command line):
-    python audio_qc.py <directory> [--gap-limit 10]
+    python audio_qc.py <directory>
 """
 
 import re
