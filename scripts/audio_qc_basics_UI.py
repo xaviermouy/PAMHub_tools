@@ -111,43 +111,65 @@ def _update_visuals(results):
 # ── Callbacks + picker widget (one block per mode) ────────────────────────────
 
 if IN_PYODIDE:
-    # Browser mode: JS reads first 512 bytes of each file for header parsing,
-    # passes path + size + base64 header to Python via tab-separated lines.
-    def _on_files_selected(file_data_str, dir_name):
-        import base64
+    # Browser mode: the file input is created dynamically in document.body so it
+    # lives outside Panel's shadow DOM and is immediately clickable.
+    # window.pyOpenFilePicker is callable from any onclick context (even shadow DOM).
+
+    picker_widget = pn.pane.HTML(
+        """
+        <button
+            onclick="if(window.pyOpenFilePicker)window.pyOpenFilePicker(event)"
+            style="padding:10px 22px; background:#0072B5; color:white; border:none;
+                   border-radius:6px; cursor:pointer; font-size:15px; font-family:sans-serif;
+                   box-shadow:0 2px 4px rgba(0,0,0,.2);">
+            Browse...
+        </button>
+        """,
+        height=55,
+    )
+
+    import asyncio
+
+    async def _on_files_changed(event):
+        """Handle the file-input change event entirely in Python."""
         from datetime import timedelta
 
-        lines = [l for l in file_data_str.split("\n") if l]
-        if not lines:
+        file_list = event.target.files
+        n = file_list.length
+        if n == 0:
             status.object = "*No files received.*"
             return
 
+        audio_exts = {"wav", "flac", "aif", "aiff"}
+        js_files = [
+            file_list.item(i) for i in range(n)
+            if file_list.item(i).name.rsplit(".", 1)[-1].lower() in audio_exts
+        ]
+        if not js_files:
+            status.object = "*No audio files found.*"
+            return
+
+        dir_name = js_files[0].webkitRelativePath.split("/")[0]
+
         records = []
         total_bytes = 0
-        skipped = 0
-        for line in lines:
-            parts = line.split("\t", 2)
-            rel_path = parts[0]
-            file_size = int(parts[1]) if len(parts) > 1 and parts[1] else None
-            header_b64 = parts[2] if len(parts) > 2 else ""
-
-            fname = rel_path.split("/")[-1]
-            if file_size:
-                total_bytes += file_size
+        for f in js_files:
+            fname = f.name
+            file_size = int(f.size)
+            total_bytes += file_size
 
             try:
                 t_start = filename_to_datetime(fname)
             except ValueError:
-                skipped += 1
                 continue
 
             sr, dur = None, None
-            if header_b64:
-                try:
-                    header_bytes = base64.b64decode(header_b64)
-                    sr, dur = get_audio_info_from_bytes(header_bytes, fname, file_size)
-                except Exception:
-                    pass
+            try:
+                array_buf = await f.slice(0, 512).arrayBuffer()
+                header_bytes = bytes(js.Uint8Array.new(array_buf).to_py())
+                sr, dur = get_audio_info_from_bytes(header_bytes, fname, file_size)
+            except Exception:
+                pass
 
             records.append({
                 "file": fname,
@@ -164,47 +186,31 @@ if IN_PYODIDE:
         if "error" in results:
             status.object = f"*{results['error']}*"
         else:
-            status.object = f"**{results['n_files']} file(s)** found in `{dir_name}/`"
+            n_found = results["n_files"]
+            status.object = f"**{n_found} file(s)** found in `{dir_name}/`"
 
-    js.window.pySetFiles = create_proxy(_on_files_selected)
+    def _open_file_picker(e=None):
+        """Create a temporary <input webkitdirectory> in document.body and click it.
+        Appending to body keeps the element outside Panel's shadow DOM so the
+        browser's user-gesture check passes and the change event fires normally."""
+        inp = js.document.createElement("input")
+        inp.type = "file"
+        inp.multiple = True
+        inp.setAttribute("webkitdirectory", "")
+        inp.style.display = "none"
+        js.document.body.appendChild(inp)
 
-    picker_widget = pn.pane.HTML(
-        """
-        <input type="file" id="dir-input" webkitdirectory multiple style="display:none">
-        <button
-            onclick="document.getElementById('dir-input').click()"
-            style="padding:10px 22px; background:#0072B5; color:white; border:none;
-                   border-radius:6px; cursor:pointer; font-size:15px; font-family:sans-serif;
-                   box-shadow:0 2px 4px rgba(0,0,0,.2);">
-            Browse...
-        </button>
-        <script>
-          document.getElementById('dir-input').addEventListener('change', async function(e) {
-              var AUDIO_RE = /\\.(wav|flac|aif|aiff)$/i;
-              var files = Array.from(e.target.files).filter(f => AUDIO_RE.test(f.name));
-              if (!files.length) return;
-              var dirName = files[0].webkitRelativePath.split('/')[0];
+        def _inp_onchange(change_event):
+            asyncio.ensure_future(_on_files_changed(change_event))
+            try:
+                js.document.body.removeChild(inp)
+            except Exception:
+                pass
 
-              // Read first 512 bytes of each file for header parsing
-              var rows = await Promise.all(files.map(async function(f) {
-                  try {
-                      var buf = await f.slice(0, 512).arrayBuffer();
-                      var b64 = btoa(
-                          Array.from(new Uint8Array(buf), b => String.fromCharCode(b)).join('')
-                      );
-                      return f.webkitRelativePath + '\\t' + f.size + '\\t' + b64;
-                  } catch(err) {
-                      return f.webkitRelativePath + '\\t' + f.size + '\\t';
-                  }
-              }));
+        inp.onchange = create_proxy(_inp_onchange)
+        inp.click()
 
-              rows.sort();
-              window.pySetFiles(rows.join('\\n'), dirName);
-          });
-        </script>
-        """,
-        height=55,
-    )
+    js.window.pyOpenFilePicker = create_proxy(_open_file_picker)
 
 else:
     # Local mode: full QC via run_qc()
@@ -264,5 +270,5 @@ app = pn.Column(
 
 app.servable()
 
-if __name__ == "__main__":
+if __name__ == "__main__" and not IN_PYODIDE:
     pn.serve(__file__, show=True, autoreload=True)
