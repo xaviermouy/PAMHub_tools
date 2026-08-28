@@ -1,11 +1,12 @@
 import logging
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import s3fs
 from ecosound.core.tools import filename_to_datetime
 import pandas as pd
 from collections import Counter
 from itertools import pairwise
-from pathlib import Path
+from pathlib import PurePosixPath
 import soundfile as sf
 from tqdm.auto import tqdm
 from pyhydrophone.soundtrap import SoundTrap
@@ -182,7 +183,7 @@ def retrieve_recording_interval(audio_files):
         )
         return None
 
-    audio_files_datetime = filename_to_datetime([Path(f).name for f in audio_files])
+    audio_files_datetime = filename_to_datetime([PurePosixPath(f).name for f in audio_files])
     times = sorted(t for t in audio_files_datetime if pd.notna(t))
 
     if len(times) < 2:
@@ -253,7 +254,7 @@ def retrieve_recorder_serial_number(audio_files, recorder_type="SoundTrap"):
 
     SN, unparsed = [], []
     for f in audio_files:
-        name = Path(f).name
+        name = PurePosixPath(f).name
         candidate = name.split(".")[0]
         if candidate.isdigit():
             SN.append(candidate)
@@ -307,7 +308,7 @@ def summarize_audio_files_metadata(df, threshold=0.9):
     Returns
     -------
     dict
-        Keys 'samplerate', 'channels', 'bit_depth', 'format', and
+        Keys 'samplerate_hz', 'channels', 'bit_depth', 'format', and
         'duration_sec', plus 'n_files' and 'n_errors'.
 
     Logs
@@ -321,7 +322,7 @@ def summarize_audio_files_metadata(df, threshold=0.9):
 
     summary = {
         field: _dominant_value(ok[field], field, threshold)
-        for field in ("samplerate", "channels", "bit_depth", "format")
+        for field in ("samplerate_hz", "channels", "bit_depth", "format")
     }
     summary["duration_sec"] = _dominant_value(
         ok["duration_sec"].round(), "duration_sec", threshold
@@ -330,7 +331,8 @@ def summarize_audio_files_metadata(df, threshold=0.9):
     summary["n_errors"] = n_errors
     return summary
 
-def retrieve_audio_files_metadata(audio_files, num_workers=16):
+def retrieve_audio_files_metadata(audio_files, num_workers=16,
+                                  subsampling_fraction=None, min_sample=10):
     """
     Read sample rate, bit depth, and duration from audio files on S3.
 
@@ -345,15 +347,36 @@ def retrieve_audio_files_metadata(audio_files, num_workers=16):
     num_workers : int, optional
         Number of concurrent header reads. Default is 16. Higher values
         tend to hit S3 throttling rather than improve throughput.
+    subsampling_fraction : float or None, optional
+        Fraction of files to read (0.0–1.0). If None or 1.0, all files
+        are read. A random subset is selected, which is usually sufficient
+        since recorder settings are constant within a deployment. Default
+        is None (read all files).
+    min_sample : int, optional
+        Minimum number of files to read regardless of `subsampling_fraction`.
+        Prevents degenerate samples on small deployments. Default is 10.
 
     Returns
     -------
     pandas.DataFrame
-        One row per file, in the order given, with columns 'path',
-        'samplerate', 'channels', 'samples', 'duration_sec', 'subtype',
-        'format', and 'bit_depth'. Files that could not be read have
-        the reason in an 'error' column and NaN elsewhere.
+        One row per sampled file with columns 'path', 'samplerate_hz',
+        'channels', 'samples', 'duration_sec', 'subtype', 'format', and
+        'bit_depth'. Files that could not be read have the reason in an
+        'error' column and NaN elsewhere.
     """
+    audio_files = list(audio_files)
+    n_total = len(audio_files)
+
+    if subsampling_fraction is not None and subsampling_fraction < 1.0:
+        n_sample = max(min_sample, int(round(n_total * subsampling_fraction)))
+        n_sample = min(n_sample, n_total)  # can't sample more than we have
+        if n_sample < n_total:
+            audio_files = random.sample(audio_files, n_sample)
+            logger.info(
+                "Subsampling %d of %d files (%.0f%%) for metadata read.",
+                n_sample, n_total, n_sample / n_total * 100,
+            )
+
     fs = s3fs.S3FileSystem()
 
     def read_one(path):
@@ -377,10 +400,13 @@ def retrieve_audio_files_metadata(audio_files, num_workers=16):
     rows = []
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = {executor.submit(read_one, path): path for path in audio_files}
-        folder_label = Path(next(iter(audio_files))).parent.name
+        folder_label = PurePosixPath(next(iter(audio_files))).parent.name
+        desc = f"  {folder_label}"
+        if subsampling_fraction is not None and subsampling_fraction < 1.0 and len(audio_files) < n_total:
+            desc += f" ({len(audio_files)}/{n_total})"
         with tqdm(
             total=len(audio_files),
-            desc=f"  {folder_label}",
+            desc=desc,
             unit=" files",
             leave=False,
         ) as pbar:
@@ -551,7 +577,8 @@ def _dominant_value(values, label, threshold=0.9):
 
 
 
-def scan_bucket_for_metadata(root_dir, min_files=1, files_num_workers=16):
+def scan_bucket_for_metadata(root_dir, min_files=1, files_num_workers=16,
+                             subsampling_fraction=None):
     """
     Build a metadata catalogue for every deployment folder under an S3 prefix.
 
@@ -571,6 +598,12 @@ def scan_bucket_for_metadata(root_dir, min_files=1, files_num_workers=16):
     files_num_workers : int, optional
         Number of concurrent S3 header reads per folder. Default is 16.
         Higher values tend to hit S3 throttling rather than improve speed.
+    subsampling_fraction : float or None, optional
+        Fraction of files to read per folder (0.0–1.0). If None, all
+        files are read. Useful for large deployments where recorder
+        settings are constant and reading every header is wasteful.
+        Passed through to `retrieve_audio_files_metadata`. Default is
+        None.
 
     Returns
     -------
@@ -578,8 +611,9 @@ def scan_bucket_for_metadata(root_dir, min_files=1, files_num_workers=16):
         One row per folder, with columns 'folder', 'n_files',
         'serial_number', 'sysgain', 'recording_interval_sec', the
         summary fields from `summarize_audio_files_metadata`, and
-        'error'. Folders that failed have the reason in 'error' and
-        NaN elsewhere.
+        'error'. 'n_files' is always the total file count in the
+        folder, regardless of sampling. Folders that failed have the
+        reason in 'error' and NaN elsewhere.
     """
     folders = list_audio_folders_s3(root_dir, min_files=min_files)
 
@@ -589,7 +623,7 @@ def scan_bucket_for_metadata(root_dir, min_files=1, files_num_workers=16):
     rows = []
     with tqdm(total=len(folders), desc="Folders", unit=" folder") as pbar:
         for folder, audio_files in folders.items():
-            pbar.set_postfix_str(Path(folder).name, refresh=True)
+            pbar.set_postfix_str(PurePosixPath(folder).name, refresh=True)
             row = {"folder": folder, "n_files": len(audio_files), "error": None}
             try:
                 row["serial_number"] = retrieve_recorder_serial_number(
@@ -600,7 +634,8 @@ def scan_bucket_for_metadata(root_dir, min_files=1, files_num_workers=16):
                 )
                 row["recording_interval_sec"] = retrieve_recording_interval(audio_files)
                 metadata = retrieve_audio_files_metadata(
-                    audio_files, num_workers=files_num_workers
+                    audio_files, num_workers=files_num_workers,
+                    subsampling_fraction=subsampling_fraction,
                 )
                 row.update(summarize_audio_files_metadata(metadata))
             except Exception as e:
