@@ -1,6 +1,7 @@
 import logging
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
 import s3fs
 from ecosound.core.tools import filename_to_datetime
 import pandas as pd
@@ -308,8 +309,9 @@ def summarize_audio_files_metadata(df, threshold=0.9):
     Returns
     -------
     dict
-        Keys 'samplerate_hz', 'channels', 'bit_depth', 'format', and
-        'duration_sec', plus 'n_files' and 'n_errors'.
+        Keys 'recording_sample_rate_hz', 'recording_n_channels',
+        'recording_bit_depth', 'format', and
+        'recording_duration_sec', plus 'n_files' and 'n_errors'.
 
     Logs
     ----
@@ -322,10 +324,10 @@ def summarize_audio_files_metadata(df, threshold=0.9):
 
     summary = {
         field: _dominant_value(ok[field], field, threshold)
-        for field in ("samplerate_hz", "channels", "bit_depth", "format")
+        for field in ("recording_sample_rate_hz", "recording_n_channels", "recording_bit_depth", "format")
     }
-    summary["duration_sec"] = _dominant_value(
-        ok["duration_sec"].round(), "duration_sec", threshold
+    summary["recording_duration_sec"] = _dominant_value(
+        ok["recording_duration_sec"].round(), "recording_duration_sec", threshold
     )
     summary["n_files"] = len(df)
     summary["n_errors"] = n_errors
@@ -359,9 +361,10 @@ def retrieve_audio_files_metadata(audio_files, num_workers=16,
     Returns
     -------
     pandas.DataFrame
-        One row per sampled file with columns 'path', 'samplerate_hz',
-        'channels', 'samples', 'duration_sec', 'subtype', 'format', and
-        'bit_depth'. Files that could not be read have the reason in an
+        One row per sampled file with columns 'path',
+        'recording_sample_rate_hz', 'recording_n_channels', 'samples',
+        'recording_duration_sec', 'subtype', 'format', and
+        'recording_bit_depth'. Files that could not be read have the reason in an
         'error' column and NaN elsewhere.
     """
     audio_files = list(audio_files)
@@ -388,13 +391,13 @@ def retrieve_audio_files_metadata(audio_files, num_workers=16,
 
         return {
             "path": path,
-            "samplerate_hz": info.samplerate,
-            "channels": info.channels,
+            "recording_sample_rate_hz": info.samplerate,
+            "recording_n_channels": info.channels,
             "samples": info.frames,
-            "duration_sec": info.duration,
+            "recording_duration_sec": info.duration,
             "subtype": info.subtype,
             "format": info.format,
-            "bit_depth": _bit_depth(info.subtype),
+            "recording_bit_depth": _bit_depth(info.subtype),
         }
 
     rows = []
@@ -415,6 +418,66 @@ def retrieve_audio_files_metadata(audio_files, num_workers=16,
                 pbar.update(1)
 
     return pd.DataFrame(rows)
+
+_model_cache = {}
+
+_OI_DEVICE_SEARCH_URL = (
+    "http://oceaninstruments.azurewebsites.net/api/Devices/Search/{serial_number}"
+)
+
+
+def lookup_soundtrap_model(serial_number):
+    """
+    Look up the recorder model for a SoundTrap serial number.
+
+    Queries the Ocean Instruments device database and returns the model
+    name (e.g. "SoundTrap 300 HF"). Results are cached per serial number.
+
+    Parameters
+    ----------
+    serial_number : str or int
+        SoundTrap recorder serial number.
+
+    Returns
+    -------
+    str or None
+        Model name as reported by Ocean Instruments, or None if the
+        serial number is not found or the query fails.
+    """
+    serial_number = str(serial_number)
+    if serial_number in _model_cache:
+        return _model_cache[serial_number]
+
+    try:
+        resp = requests.get(
+            _OI_DEVICE_SEARCH_URL.format(serial_number=serial_number),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        devices = resp.json()
+    except Exception as e:
+        logger.warning(
+            "Model lookup failed for serial %s: %s: %s. Returning None.",
+            serial_number, type(e).__name__, e,
+        )
+        return None
+
+    if not devices:
+        logger.warning(
+            "Serial %s not found in the Ocean Instruments database. "
+            "Cannot determine recorder model. Returning None.",
+            serial_number,
+        )
+        return None
+
+    # If multiple devices match, pick the one whose serialNo matches exactly
+    matches = [d for d in devices if d.get("serialNo") == serial_number]
+    device = matches[0] if matches else devices[0]
+    model = device.get("modelName")
+
+    _model_cache[serial_number] = model
+    return model
+
 
 _sysgain_cache = {}
 
@@ -577,16 +640,19 @@ def _dominant_value(values, label, threshold=0.9):
 
 
 
-def scan_bucket_for_metadata(root_dir, min_files=1, files_num_workers=16,
-                             subsampling_fraction=None):
+def scan_bucket_for_audio_metadata(root_dir, min_files=1, files_num_workers=16,
+                             subsampling_fraction=None,
+                             recorder_type="SoundTrap", gain_type="High"):
     """
     Build a metadata catalogue for every deployment folder under an S3 prefix.
 
     Finds folders containing audio files, then extracts the recorder
     serial number, calibration gain, recording interval, and audio file
-    properties for each one. Folders are processed one at a time so that
-    the per-file progress bar renders correctly in Jupyter notebooks.
-    File headers within each folder are read concurrently.
+    properties for each one. The recorder model is looked up automatically
+    from the Ocean Instruments database using the serial number. Folders
+    are processed one at a time so that the per-file progress bar renders
+    correctly in Jupyter notebooks. File headers within each folder are
+    read concurrently.
 
     Parameters
     ----------
@@ -604,12 +670,21 @@ def scan_bucket_for_metadata(root_dir, min_files=1, files_num_workers=16,
         settings are constant and reading every header is wasteful.
         Passed through to `retrieve_audio_files_metadata`. Default is
         None.
+    recorder_type : str, optional
+        Recorder type, used for serial number parsing and calibration
+        lookup. Only "SoundTrap" is currently supported. Default is
+        "SoundTrap".
+    gain_type : {'High', 'Low'}, optional
+        Gain setting used during the deployments, passed to
+        `lookup_soundtrap_sysgain`. Default is "High".
 
     Returns
     -------
     pandas.DataFrame
         One row per folder, with columns 'folder', 'n_files',
-        'serial_number', 'sysgain', 'recording_interval_sec', the
+        'recorder_model', 'recorder_serial_number', 'gain_type',
+        'sysgain', 'recording_interval_sec',
+        'recording_start_datetime', 'recording_end_datetime', the
         summary fields from `summarize_audio_files_metadata`, and
         'error'. 'n_files' is always the total file count in the
         folder, regardless of sampling. Folders that failed have the
@@ -626,13 +701,29 @@ def scan_bucket_for_metadata(root_dir, min_files=1, files_num_workers=16,
             pbar.set_postfix_str(PurePosixPath(folder).name, refresh=True)
             row = {"folder": folder, "n_files": len(audio_files), "error": None}
             try:
-                row["serial_number"] = retrieve_recorder_serial_number(
-                    audio_files, recorder_type="SoundTrap"
+                row["recorder_serial_number"] = retrieve_recorder_serial_number(
+                    audio_files, recorder_type=recorder_type
                 )
+                row["recorder_model"] = lookup_soundtrap_model(
+                    row["recorder_serial_number"]
+                )
+                row["gain_type"] = gain_type
                 row["sysgain"] = lookup_soundtrap_sysgain(
-                    row["serial_number"], gain_type="High"
+                    row["recorder_serial_number"], gain_type=gain_type,
+                    model=row["recorder_model"] or "ST300HF",
                 )
                 row["recording_interval_sec"] = retrieve_recording_interval(audio_files)
+
+                # Extract start and end datetimes from file names
+                times = sorted(
+                    t for t in filename_to_datetime(
+                        [PurePosixPath(f).name for f in audio_files]
+                    )
+                    if pd.notna(t)
+                )
+                row["recording_start_datetime"] = times[0] if times else None
+                row["recording_end_datetime"] = times[-1] if times else None
+
                 metadata = retrieve_audio_files_metadata(
                     audio_files, num_workers=files_num_workers,
                     subsampling_fraction=subsampling_fraction,
@@ -657,5 +748,11 @@ if __name__ == "__main__":
             logging.FileHandler(log_file),    # timestamped log file
         ],
     )
-    df = scan_bucket_for_metadata(deployment_dir, min_files=1, files_num_workers=16)
+    df = scan_bucket_for_audio_metadata(deployment_dir,
+                                  min_files=1,
+                                  files_num_workers=16,
+                                  subsampling_fraction=0.3,
+                                  recorder_type="SoundTrap",
+                                  gain_type="High",
+                                  files_num_workers=16)
     print(df)
