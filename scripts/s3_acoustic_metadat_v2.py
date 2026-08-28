@@ -1,17 +1,25 @@
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import s3fs
 from ecosound.core.tools import filename_to_datetime
 import pandas as pd
 from collections import Counter
 from itertools import pairwise
-import warnings
 from pathlib import Path
 import soundfile as sf
 import dask.bag as db
+from tqdm.auto import tqdm
 from pyhydrophone.soundtrap import SoundTrap
-warnings.simplefilter("always")
+
+logger = logging.getLogger(__name__)
+# To see log output in a Jupyter notebook, configure logging before calling
+# any function, e.g.:
+#   import logging
+#   logging.basicConfig(level=logging.WARNING,
+#                       format="%(asctime)s  %(levelname)-8s  %(message)s")
 
 
-deployment_dir="s3://neracoos-pam-data-ingest/Wellfleet/Wellfleet (1) April 22 2014 - May 21 2014/Soundtrap May 20 2014 Retrieval/Soundtrap May 20 2014 retrieval/"
+deployment_dir="s3://neracoos-pam-data-ingest/Wellfleet/Wellfleet (1) April 22 2014 - May 21 2014/"
 
 
 
@@ -105,13 +113,16 @@ def list_audio_folders_s3(root_dir, audio_extensions=(".wav", ".flac", ".aif", "
     fs = s3fs.S3FileSystem()
 
     folders = {}
-    for folder, _dirs, files in fs.walk(root_dir, maxdepth=maxdepth):
-        # Reuse the filesystem and file list from the walk to avoid an extra
-        # ls() call and a new S3FileSystem object per folder.
-        full_paths = [f"{folder}/{f}" for f in files]
-        audio_files = _filter_audio_files(full_paths, audio_extensions)
-        if len(audio_files) >= min_files:
-            folders[folder] = audio_files
+    with tqdm(desc="Walking S3", unit=" dirs", leave=True) as pbar:
+        for folder, _dirs, files in fs.walk(root_dir, maxdepth=maxdepth):
+            # Reuse the filesystem and file list from the walk to avoid an extra
+            # ls() call and a new S3FileSystem object per folder.
+            full_paths = [f"{folder}/{f}" for f in files]
+            audio_files = _filter_audio_files(full_paths, audio_extensions)
+            if len(audio_files) >= min_files:
+                folders[folder] = audio_files
+            pbar.update(1)
+            pbar.set_postfix({"audio folders": len(folders)})
 
     return dict(sorted(folders.items()))
 
@@ -138,14 +149,14 @@ def retrieve_recording_interval(audio_files):
         has no interval) or when fewer than two timestamps could be
         parsed from the file names.
 
-    Warns
-    -----
-    UserWarning
+    Logs
+    ----
+    WARNING
         If the most common interval covers less than 90% of the gaps. The
         message reports the coverage and lists the next most frequent
         intervals, which distinguishes missing files (large multiples of
         the nominal interval) from timestamp jitter (neighbouring values).
-    UserWarning
+    WARNING
         If the interval cannot be determined, in which case None is
         returned.
 
@@ -159,10 +170,10 @@ def retrieve_recording_interval(audio_files):
     3600
     """
     if len(audio_files) < 2:
-        warnings.warn(
-            f"Cannot determine a recording interval from {len(audio_files)} file(s); "
-            f"at least 2 are needed. Returning None.",
-            stacklevel=2,
+        logger.warning(
+            "Cannot determine a recording interval from %d file(s); "
+            "at least 2 are needed. Returning None.",
+            len(audio_files),
         )
         return None
 
@@ -170,10 +181,10 @@ def retrieve_recording_interval(audio_files):
     times = sorted(t for t in audio_files_datetime if pd.notna(t))
 
     if len(times) < 2:
-        warnings.warn(
-            f"Only {len(times)} of {len(audio_files)} file names yielded a valid "
-            f"timestamp; cannot determine a recording interval. Returning None.",
-            stacklevel=2,
+        logger.warning(
+            "Only %d of %d file names yielded a valid timestamp; "
+            "cannot determine a recording interval. Returning None.",
+            len(times), len(audio_files),
         )
         return None
 
@@ -214,9 +225,9 @@ def retrieve_recorder_serial_number(audio_files, recorder_type="SoundTrap"):
         number, or if more than one distinct serial number is found. The
         latter usually means the file list spans more than one deployment.
 
-    Warns
-    -----
-    UserWarning
+    Logs
+    ----
+    WARNING
         If some file names could not be parsed while others could. The
         message reports how many were skipped and gives an example.
 
@@ -252,10 +263,9 @@ def retrieve_recorder_serial_number(audio_files, recorder_type="SoundTrap"):
         )
 
     if unparsed:
-        warnings.warn(
-            f"{len(unparsed)} of {len(audio_files)} file names could not be parsed "
-            f"and were ignored (e.g. {unparsed[0]!r}).",
-            stacklevel=2,
+        logger.warning(
+            "%d of %d file names could not be parsed and were ignored (e.g. %r).",
+            len(unparsed), len(audio_files), unparsed[0],
         )
 
     SN_counts = Counter(SN)
@@ -295,9 +305,9 @@ def summarize_audio_files_metadata(df, threshold=0.9):
         Keys 'samplerate', 'channels', 'bit_depth', 'format', and
         'duration_sec', plus 'n_files' and 'n_errors'.
 
-    Warns
-    -----
-    UserWarning
+    Logs
+    ----
+    WARNING
         Once per inconsistent setting, reporting the coverage and the
         next most frequent values.
     """
@@ -405,9 +415,9 @@ def lookup_soundtrap_sysgain(serial_number, gain_type="High", model="ST300HF"):
     ValueError
         If `gain_type` is not 'High' or 'Low'.
 
-    Warns
-    -----
-    UserWarning
+    Logs
+    ----
+    WARNING
         If the serial number is not in the database, or if the query
         fails for any other reason. None is returned in both cases.
 
@@ -444,17 +454,15 @@ def lookup_soundtrap_sysgain(serial_number, gain_type="High", model="ST300HF"):
         )
         sysgain = float(st.sensitivity)
     except TypeError:
-        warnings.warn(
-            f"Serial {serial_number} not found in the Ocean Instruments database. "
-            f"Returning None.",
-            stacklevel=2,
+        logger.warning(
+            "Serial %s not found in the Ocean Instruments database. Returning None.",
+            serial_number,
         )
         return None
     except Exception as e:
-        warnings.warn(
-            f"Sensitivity lookup failed for serial {serial_number} "
-            f"({gain_type} gain): {type(e).__name__}: {e}. Returning None.",
-            stacklevel=2,
+        logger.warning(
+            "Sensitivity lookup failed for serial %s (%s gain): %s: %s. Returning None.",
+            serial_number, gain_type, type(e).__name__, e,
         )
         return None
 
@@ -504,16 +512,16 @@ def _dominant_value(values, label, threshold=0.9):
     object or None
         Most frequent value, or None if `values` contains nothing usable.
 
-    Warns
-    -----
-    UserWarning
+    Logs
+    ----
+    WARNING
         If the most frequent value covers less than `threshold` of the
         values, or if all values are missing.
     """
     usable = [v for v in values if pd.notna(v)]
 
     if not usable:
-        warnings.warn(f"No usable {label} values found.", stacklevel=2)
+        logger.warning("No usable %s values found.", label)
         return None
 
     counts = Counter(usable)
@@ -522,10 +530,9 @@ def _dominant_value(values, label, threshold=0.9):
 
     if fraction < threshold:
         others = ", ".join(f"{v} ×{c}" for v, c in counts.most_common(4)[1:])
-        warnings.warn(
-            f"Inconsistent {label}: {most_common} covers {fraction:.1%} "
-            f"of {len(usable)} files. Also seen: {others}",
-            stacklevel=2,
+        logger.warning(
+            "Inconsistent %s: %s covers %.1f%% of %d files. Also seen: %s",
+            label, most_common, fraction * 100, len(usable), others,
         )
 
     return most_common
@@ -588,15 +595,30 @@ def scan_bucket_for_metadata(root_dir, min_files=1, num_workers=4, files_num_wor
     if not folders:
         return pd.DataFrame(columns=["folder", "n_files", "error"])
 
-    rows = (
-        db.from_sequence(list(folders.items()), npartitions=len(folders))
-        .map(_scan_one_folder, num_workers=files_num_workers)
-        .compute(scheduler="threads", num_workers=num_workers)
-    )
+    rows = []
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {
+            executor.submit(_scan_one_folder, item, files_num_workers): item[0]
+            for item in folders.items()
+        }
+        with tqdm(total=len(folders), desc="Scanning folders", unit=" folder") as pbar:
+            for future in as_completed(futures):
+                rows.append(future.result())
+                pbar.update(1)
 
     return pd.DataFrame(rows)
 
 
 if __name__ == "__main__":
+    import datetime
+    log_file = f"s3_metadata_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        handlers=[
+            logging.StreamHandler(),          # console
+            logging.FileHandler(log_file),    # timestamped log file
+        ],
+    )
     df = scan_bucket_for_metadata(deployment_dir, min_files=1, num_workers=4, files_num_workers=8)
     print(df)
