@@ -630,6 +630,21 @@ def _dominant_value(values, label, threshold=0.9):
 
 
 
+class _WarningCollector(logging.Handler):
+    """Log handler that collects WARNING messages into a list."""
+
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.messages = []
+
+    def emit(self, record):
+        if record.levelno >= logging.WARNING:
+            self.messages.append(self.format(record))
+
+    def clear(self):
+        self.messages = []
+
+
 def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
                              files_num_workers=16,
                              subsampling_fraction=None,
@@ -689,10 +704,15 @@ def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
     if not folders:
         return pd.DataFrame(columns=["folder", "n_files", "error"])
 
+    # Handler that captures warning messages per folder
+    warning_collector = _WarningCollector()
+    logger.addHandler(warning_collector)
+
     rows = []
     with tqdm(total=len(folders), desc="Folders", unit=" folder") as pbar:
         for folder, audio_files in folders.items():
             pbar.set_postfix_str(PurePosixPath(folder).name, refresh=True)
+            warning_collector.clear()
             row = {"folder": folder, "n_files": len(audio_files), "error": None}
             try:
                 row["recorder_type"] = recorder_type
@@ -726,8 +746,11 @@ def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
                 row.update(summarize_audio_files_metadata(metadata))
             except Exception as e:
                 row["error"] = f"{type(e).__name__}: {e}"
+            row["warnings"] = "; ".join(warning_collector.messages) or None
             rows.append(row)
             pbar.update(1)
+
+    logger.removeHandler(warning_collector)
 
     df = pd.DataFrame(rows)
 
@@ -751,14 +774,13 @@ if __name__ == "__main__":
     )
 
     deployment_dir = "s3://neracoos-pam-data-ingest/Wellfleet/Wellfleet (1) April 22 2014 - May 21 2014/"
-    output_csv = ""
+    output_csv = "s3://neracoos-pam-output/tests_xavier/wellfleet_metadata.csv"
 
     df = scan_bucket_for_audio_metadata(deployment_dir,
                                   min_files=1,
-                                  files_num_workers=16,
+                                  files_num_workers=32,
                                   subsampling_fraction=0.3,
                                   recorder_type="SoundTrap",
                                   gain_type="High",
-                                  files_num_workers=16,
                                   output_csv=output_csv)
     print(df)
