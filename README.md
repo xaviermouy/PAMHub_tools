@@ -33,6 +33,67 @@ This produces two files that must be deployed together:
 
 ---
 
+### `s3_acoustic_metadat_v2.py` — S3 Audio Metadata Scanner
+
+Scans an S3 bucket for audio files (WAV, FLAC, AIF) and builds a metadata
+catalogue with one row per deployment folder. For each folder it extracts:
+
+- **Recorder info**: serial number, model (auto-detected from the Ocean
+  Instruments database), gain type, and end-to-end system gain (sysgain)
+- **Recording schedule**: start/end datetimes, duty cycle interval, file
+  duration
+- **Audio properties**: sample rate, bit depth, number of channels, format
+
+The main entry point is `scan_bucket_for_audio_metadata()`.
+
+**Parameters:**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `root_dir` | *(required)* | S3 path to crawl, e.g. `"s3://my-bucket/Wellfleet"` |
+| `output_csv` | `None` | Path to save results as CSV. `None` = no file written |
+| `min_files` | `1` | Minimum audio files for a folder to be included |
+| `files_num_workers` | `16` | Concurrent S3 header reads per folder |
+| `subsampling_fraction` | `None` | Fraction of files to read (0.0–1.0). `None` = all files |
+| `recorder_type` | `"SoundTrap"` | Recorder type for filename parsing. Only `"SoundTrap"` currently supported |
+| `gain_type` | `"High"` | Gain setting (`"High"` or `"Low"`) |
+
+**Output columns:**
+
+`folder`, `n_files`, `recorder_type`, `recorder_serial_number`,
+`recorder_model`, `gain_type`, `sysgain`, `recording_interval_sec`,
+`recording_start_datetime`, `recording_end_datetime`,
+`recording_sample_rate_hz`, `recording_n_channels`, `recording_bit_depth`,
+`recording_format`, `recording_duration_sec`, `n_errors`, `error`,
+`warnings`
+
+**Example usage (Jupyter notebook on Nebari):**
+
+```python
+import logging
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+)
+
+from s3_acoustic_metadat_v2 import scan_bucket_for_audio_metadata
+
+# Scan all deployments under a site, reading 10% of file headers per folder
+df = scan_bucket_for_audio_metadata(
+    "s3://neracoos-pam-data-ingest/Wellfleet",
+    output_csv="wellfleet_metadata.csv",
+    subsampling_fraction=0.1,
+    gain_type="High",
+)
+
+df
+```
+
+**Dependencies:** `s3fs`, `soundfile`, `pandas`, `tqdm`, `requests`,
+`pyhydrophone`, `ecosound`
+
+---
+
 ### `upload_data_to_cloud.py` — Upload Data to AWS S3
 
 > **Status: Draft / In development — not operational**
