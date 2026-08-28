@@ -550,33 +550,16 @@ def _dominant_value(values, label, threshold=0.9):
     return most_common
 
 
-def _scan_one_folder(item, num_workers=8):
-    """Collect metadata for a single deployment folder. Never raises."""
-    folder, audio_files = item
-    row = {"folder": folder, "n_files": len(audio_files), "error": None}
 
-    try:
-        row["serial_number"] = retrieve_recorder_serial_number(
-            audio_files, recorder_type="SoundTrap"
-        )
-        row["sysgain"] = lookup_soundtrap_sysgain(row["serial_number"], gain_type="High")
-        row["recording_interval_sec"] = retrieve_recording_interval(audio_files)
-
-        metadata = retrieve_audio_files_metadata(audio_files, num_workers=num_workers)
-        row.update(summarize_audio_files_metadata(metadata))
-    except Exception as e:
-        row["error"] = f"{type(e).__name__}: {e}"
-
-    return row
-
-
-def scan_bucket_for_metadata(root_dir, min_files=1, num_workers=4, files_num_workers=8):
+def scan_bucket_for_metadata(root_dir, min_files=1, files_num_workers=16):
     """
     Build a metadata catalogue for every deployment folder under an S3 prefix.
 
     Finds folders containing audio files, then extracts the recorder
     serial number, calibration gain, recording interval, and audio file
-    properties for each one. Folders are processed concurrently.
+    properties for each one. Folders are processed one at a time so that
+    the per-file progress bar renders correctly in Jupyter notebooks.
+    File headers within each folder are read concurrently.
 
     Parameters
     ----------
@@ -585,13 +568,9 @@ def scan_bucket_for_metadata(root_dir, min_files=1, num_workers=4, files_num_wor
     min_files : int, optional
         Minimum number of audio files a folder must contain to be
         included. Default is 1.
-    num_workers : int, optional
-        Number of folders processed concurrently. Default is 4.
     files_num_workers : int, optional
-        Number of concurrent header reads within each folder. Default
-        is 8. The product of this and `num_workers` is the total number
-        of concurrent S3 connections; much above ~64 tends to trigger
-        throttling.
+        Number of concurrent S3 header reads per folder. Default is 16.
+        Higher values tend to hit S3 throttling rather than improve speed.
 
     Returns
     -------
@@ -608,15 +587,26 @@ def scan_bucket_for_metadata(root_dir, min_files=1, num_workers=4, files_num_wor
         return pd.DataFrame(columns=["folder", "n_files", "error"])
 
     rows = []
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = {
-            executor.submit(_scan_one_folder, item, files_num_workers): item[0]
-            for item in folders.items()
-        }
-        with tqdm(total=len(folders), desc="Scanning folders", unit=" folder") as pbar:
-            for future in as_completed(futures):
-                rows.append(future.result())
-                pbar.update(1)
+    with tqdm(total=len(folders), desc="Folders", unit=" folder") as pbar:
+        for folder, audio_files in folders.items():
+            pbar.set_postfix_str(Path(folder).name, refresh=True)
+            row = {"folder": folder, "n_files": len(audio_files), "error": None}
+            try:
+                row["serial_number"] = retrieve_recorder_serial_number(
+                    audio_files, recorder_type="SoundTrap"
+                )
+                row["sysgain"] = lookup_soundtrap_sysgain(
+                    row["serial_number"], gain_type="High"
+                )
+                row["recording_interval_sec"] = retrieve_recording_interval(audio_files)
+                metadata = retrieve_audio_files_metadata(
+                    audio_files, num_workers=files_num_workers
+                )
+                row.update(summarize_audio_files_metadata(metadata))
+            except Exception as e:
+                row["error"] = f"{type(e).__name__}: {e}"
+            rows.append(row)
+            pbar.update(1)
 
     return pd.DataFrame(rows)
 
@@ -632,5 +622,5 @@ if __name__ == "__main__":
             logging.FileHandler(log_file),    # timestamped log file
         ],
     )
-    df = scan_bucket_for_metadata(deployment_dir, min_files=1, num_workers=4, files_num_workers=8)
+    df = scan_bucket_for_metadata(deployment_dir, min_files=1, files_num_workers=16)
     print(df)
