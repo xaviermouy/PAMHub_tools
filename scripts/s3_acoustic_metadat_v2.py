@@ -13,16 +13,6 @@ from tqdm.auto import tqdm
 from pyhydrophone.soundtrap import SoundTrap
 
 logger = logging.getLogger(__name__)
-# To see log output in a Jupyter notebook, configure logging before calling
-# any function, e.g.:
-#   import logging
-#   logging.basicConfig(level=logging.WARNING,
-#                       format="%(asctime)s  %(levelname)-8s  %(message)s")
-
-
-deployment_dir="s3://neracoos-pam-data-ingest/Wellfleet/Wellfleet (1) April 22 2014 - May 21 2014/"
-
-
 
 def list_audio_files_s3(deployment_dir, audio_extensions=(".wav", ".flac", ".aif", ".aiff")):
     """
@@ -310,7 +300,7 @@ def summarize_audio_files_metadata(df, threshold=0.9):
     -------
     dict
         Keys 'recording_sample_rate_hz', 'recording_n_channels',
-        'recording_bit_depth', 'format', and
+        'recording_bit_depth', 'recording_format', and
         'recording_duration_sec', plus 'n_files' and 'n_errors'.
 
     Logs
@@ -324,7 +314,7 @@ def summarize_audio_files_metadata(df, threshold=0.9):
 
     summary = {
         field: _dominant_value(ok[field], field, threshold)
-        for field in ("recording_sample_rate_hz", "recording_n_channels", "recording_bit_depth", "format")
+        for field in ("recording_sample_rate_hz", "recording_n_channels", "recording_bit_depth", "recording_format")
     }
     summary["recording_duration_sec"] = _dominant_value(
         ok["recording_duration_sec"].round(), "recording_duration_sec", threshold
@@ -363,7 +353,7 @@ def retrieve_audio_files_metadata(audio_files, num_workers=16,
     pandas.DataFrame
         One row per sampled file with columns 'path',
         'recording_sample_rate_hz', 'recording_n_channels', 'samples',
-        'recording_duration_sec', 'subtype', 'format', and
+        'recording_duration_sec', 'subtype', 'recording_format', and
         'recording_bit_depth'. Files that could not be read have the reason in an
         'error' column and NaN elsewhere.
     """
@@ -396,7 +386,7 @@ def retrieve_audio_files_metadata(audio_files, num_workers=16,
             "samples": info.frames,
             "recording_duration_sec": info.duration,
             "subtype": info.subtype,
-            "format": info.format,
+            "recording_format": info.format,
             "recording_bit_depth": _bit_depth(info.subtype),
         }
 
@@ -640,7 +630,8 @@ def _dominant_value(values, label, threshold=0.9):
 
 
 
-def scan_bucket_for_audio_metadata(root_dir, min_files=1, files_num_workers=16,
+def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
+                             files_num_workers=16,
                              subsampling_fraction=None,
                              recorder_type="SoundTrap", gain_type="High"):
     """
@@ -658,6 +649,9 @@ def scan_bucket_for_audio_metadata(root_dir, min_files=1, files_num_workers=16,
     ----------
     root_dir : str
         S3 path to crawl, e.g. "s3://neracoos-pam-data-ingest/Wellfleet".
+    output_csv : str or None, optional
+        Path to save the resulting DataFrame as a CSV file. If None, no
+        file is written. Default is None.
     min_files : int, optional
         Minimum number of audio files a folder must contain to be
         included. Default is 1.
@@ -701,6 +695,7 @@ def scan_bucket_for_audio_metadata(root_dir, min_files=1, files_num_workers=16,
             pbar.set_postfix_str(PurePosixPath(folder).name, refresh=True)
             row = {"folder": folder, "n_files": len(audio_files), "error": None}
             try:
+                row["recorder_type"] = recorder_type
                 row["recorder_serial_number"] = retrieve_recorder_serial_number(
                     audio_files, recorder_type=recorder_type
                 )
@@ -734,7 +729,13 @@ def scan_bucket_for_audio_metadata(root_dir, min_files=1, files_num_workers=16,
             rows.append(row)
             pbar.update(1)
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+
+    if output_csv is not None:
+        df.to_csv(output_csv, index=False)
+        print(f"\nMetadata saved to {output_csv}")
+
+    return df
 
 
 if __name__ == "__main__":
@@ -748,11 +749,16 @@ if __name__ == "__main__":
             logging.FileHandler(log_file),    # timestamped log file
         ],
     )
+
+    deployment_dir = "s3://neracoos-pam-data-ingest/Wellfleet/Wellfleet (1) April 22 2014 - May 21 2014/"
+    output_csv = ""
+
     df = scan_bucket_for_audio_metadata(deployment_dir,
                                   min_files=1,
                                   files_num_workers=16,
                                   subsampling_fraction=0.3,
                                   recorder_type="SoundTrap",
                                   gain_type="High",
-                                  files_num_workers=16)
+                                  files_num_workers=16,
+                                  output_csv=output_csv)
     print(df)
