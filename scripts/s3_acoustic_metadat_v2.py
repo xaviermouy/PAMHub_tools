@@ -7,7 +7,6 @@ from collections import Counter
 from itertools import pairwise
 from pathlib import Path
 import soundfile as sf
-import dask.bag as db
 from tqdm.auto import tqdm
 from pyhydrophone.soundtrap import SoundTrap
 
@@ -124,7 +123,13 @@ def list_audio_folders_s3(root_dir, audio_extensions=(".wav", ".flac", ".aif", "
             pbar.update(1)
             pbar.set_postfix({"audio folders": len(folders)})
 
-    return dict(sorted(folders.items()))
+    folders = dict(sorted(folders.items()))
+
+    print(f"\nFound {len(folders)} folder(s) with audio files:")
+    for folder, audio_files in folders.items():
+        print(f"  {folder}  ({len(audio_files)} files)")
+
+    return folders
 
 def retrieve_recording_interval(audio_files):
     """Estimate the nominal time interval between consecutive recordings.
@@ -325,14 +330,13 @@ def summarize_audio_files_metadata(df, threshold=0.9):
     summary["n_errors"] = n_errors
     return summary
 
-def retrieve_audio_files_metadata(audio_files, num_workers=16, npartitions=64):
+def retrieve_audio_files_metadata(audio_files, num_workers=16):
     """
     Read sample rate, bit depth, and duration from audio files on S3.
 
     Reads only file headers, so no audio data is transferred. Files are
-    read concurrently using Dask's threaded scheduler, which suits this
-    workload because it is dominated by network latency rather than
-    computation. No Dask client or cluster is required.
+    read concurrently using a thread pool, which suits this workload
+    because it is dominated by network latency rather than computation.
 
     Parameters
     ----------
@@ -341,10 +345,6 @@ def retrieve_audio_files_metadata(audio_files, num_workers=16, npartitions=64):
     num_workers : int, optional
         Number of concurrent header reads. Default is 16. Higher values
         tend to hit S3 throttling rather than improve throughput.
-    npartitions : int, optional
-        Number of chunks the file list is split into. Should be at least
-        `num_workers` so every thread has work; a few times larger gives
-        better load balancing. Default is 64.
 
     Returns
     -------
@@ -374,8 +374,20 @@ def retrieve_audio_files_metadata(audio_files, num_workers=16, npartitions=64):
             "bit_depth": _bit_depth(info.subtype),
         }
 
-    bag = db.from_sequence(audio_files, npartitions=min(npartitions, len(audio_files)))
-    rows = bag.map(read_one).compute(scheduler="threads", num_workers=num_workers)
+    rows = []
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(read_one, path): path for path in audio_files}
+        folder_label = Path(next(iter(audio_files))).parent.name
+        with tqdm(
+            total=len(audio_files),
+            desc=f"  {folder_label}",
+            unit=" files",
+            leave=False,
+        ) as pbar:
+            for future in as_completed(futures):
+                rows.append(future.result())
+                pbar.update(1)
+
     return pd.DataFrame(rows)
 
 _sysgain_cache = {}
