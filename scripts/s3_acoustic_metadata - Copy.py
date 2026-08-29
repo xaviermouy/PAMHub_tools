@@ -324,8 +324,7 @@ def summarize_audio_files_metadata(df, threshold=0.9):
     return summary
 
 def retrieve_audio_files_metadata(audio_files, num_workers=16,
-                                  subsampling_fraction=None, min_sample=10,
-                                  max_sample=20):
+                                  subsampling_fraction=None, min_sample=10):
     """
     Read sample rate, bit depth, and duration from audio files on S3.
 
@@ -348,12 +347,6 @@ def retrieve_audio_files_metadata(audio_files, num_workers=16,
     min_sample : int, optional
         Minimum number of files to read regardless of `subsampling_fraction`.
         Prevents degenerate samples on small deployments. Default is 10.
-    max_sample : int or None, optional
-        Maximum number of files to read per folder. When set, the sample
-        size is capped at this value regardless of `subsampling_fraction`.
-        Reading 15–20 files is usually enough to detect inconsistencies
-        while keeping the header phase O(folders) instead of O(files).
-        Default is 20. Set to None to disable the cap.
 
     Returns
     -------
@@ -367,25 +360,21 @@ def retrieve_audio_files_metadata(audio_files, num_workers=16,
     audio_files = list(audio_files)
     n_total = len(audio_files)
 
-    # Determine sample size: start from fraction if given, then apply caps
-    n_sample = n_total
     if subsampling_fraction is not None and subsampling_fraction < 1.0:
         n_sample = max(min_sample, int(round(n_total * subsampling_fraction)))
-    if max_sample is not None:
-        n_sample = min(n_sample, max_sample)
-    n_sample = min(n_sample, n_total)  # can't sample more than we have
-    if n_sample < n_total:
-        audio_files = random.sample(audio_files, n_sample)
-        logger.info(
-            "Subsampling %d of %d files (%.0f%%) for metadata read.",
-            n_sample, n_total, n_sample / n_total * 100,
-        )
+        n_sample = min(n_sample, n_total)  # can't sample more than we have
+        if n_sample < n_total:
+            audio_files = random.sample(audio_files, n_sample)
+            logger.info(
+                "Subsampling %d of %d files (%.0f%%) for metadata read.",
+                n_sample, n_total, n_sample / n_total * 100,
+            )
 
     fs = s3fs.S3FileSystem()
 
     def read_one(path):
         try:
-            with fs.open(path, "rb", block_size=64 * 1024, cache_type="bytes") as f:
+            with fs.open(path, "rb") as f:
                 info = sf.info(f)
         except Exception as e:
             return {"path": path, "error": str(e)}
@@ -406,7 +395,7 @@ def retrieve_audio_files_metadata(audio_files, num_workers=16,
         futures = {executor.submit(read_one, path): path for path in audio_files}
         folder_label = PurePosixPath(next(iter(audio_files))).parent.name
         desc = f"  {folder_label}"
-        if len(audio_files) < n_total:
+        if subsampling_fraction is not None and subsampling_fraction < 1.0 and len(audio_files) < n_total:
             desc += f" ({len(audio_files)}/{n_total})"
         with tqdm(
             total=len(audio_files),
@@ -658,7 +647,7 @@ class _WarningCollector(logging.Handler):
 
 def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
                              files_num_workers=16,
-                             subsampling_fraction=None, max_sample=20,
+                             subsampling_fraction=None,
                              recorder_type="SoundTrap", gain_type="High"):
     """
     Build a metadata catalogue for every deployment folder under an S3 prefix.
@@ -690,9 +679,6 @@ def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
         settings are constant and reading every header is wasteful.
         Passed through to `retrieve_audio_files_metadata`. Default is
         None.
-    max_sample : int or None, optional
-        Maximum number of files to read per folder, regardless of
-        `subsampling_fraction`. Default is 20. Set to None to disable.
     recorder_type : str, optional
         Recorder type, used for serial number parsing and calibration
         lookup. Only "SoundTrap" is currently supported. Default is
@@ -770,7 +756,6 @@ def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
                 metadata = retrieve_audio_files_metadata(
                     audio_files, num_workers=files_num_workers,
                     subsampling_fraction=subsampling_fraction,
-                    max_sample=max_sample,
                 )
                 row.update(summarize_audio_files_metadata(metadata))
             except Exception as e:
@@ -812,7 +797,6 @@ if __name__ == "__main__":
                                   min_files=1,
                                   files_num_workers=32,
                                   subsampling_fraction=0.3,
-                                  max_sample=50,
                                   recorder_type="SoundTrap",
                                   gain_type="High",
                                   output_csv=output_csv)
