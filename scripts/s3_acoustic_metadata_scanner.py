@@ -804,7 +804,7 @@ if __name__ == "__main__":
         ],
     )
 
-    deployment_dir = "s3://neracoos-pam-data-ingest/Wellfleet/Wellfleet (1) April 22 2014 - May 21 2014/"
+    deployment_dir = "s3://neracoos-pam-data-ingest/Wellfleet"
     output_csv = "s3://neracoos-pam-output/tests_xavier/wellfleet_metadata.csv"
 
     df = scan_bucket_for_audio_metadata(deployment_dir,
