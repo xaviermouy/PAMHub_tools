@@ -301,7 +301,7 @@ def summarize_audio_files_metadata(df, threshold=0.9):
     dict
         Keys 'recording_sample_rate_hz', 'recording_n_channels',
         'recording_bit_depth', 'recording_format', and
-        'recording_duration_sec', plus 'n_files' and 'n_errors'.
+        'recording_duration_sec', plus 'n_errors'.
 
     Logs
     ----
@@ -319,7 +319,6 @@ def summarize_audio_files_metadata(df, threshold=0.9):
     summary["recording_duration_sec"] = _dominant_value(
         ok["recording_duration_sec"].round(), "recording_duration_sec", threshold
     )
-    summary["n_files"] = len(df)
     summary["n_errors"] = n_errors
     return summary
 
@@ -812,7 +811,7 @@ if __name__ == "__main__":
                                   min_files=1,
                                   files_num_workers=32,
                                   subsampling_fraction=0.3,
-                                  max_sample=50,
+                                  max_sample=30,
                                   recorder_type="SoundTrap",
                                   gain_type="High",
                                   output_csv=output_csv)
