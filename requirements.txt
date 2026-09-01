@@ -1,0 +1,12 @@
+boto3
+cmocean
+ecosound
+fsspec
+matplotlib
+pandas
+panel
+pyhydrophone>=0.4.0
+requests
+s3fs
+soundfile
+tqdm

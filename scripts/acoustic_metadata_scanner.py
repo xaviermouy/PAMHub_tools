@@ -1,33 +1,42 @@
 import logging
+import os
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+import fsspec
 import s3fs
 from ecosound.core.tools import filename_to_datetime
 import pandas as pd
 from collections import Counter
 from itertools import pairwise
-from pathlib import PurePosixPath
 import soundfile as sf
 from tqdm.auto import tqdm
 from pyhydrophone.soundtrap import SoundTrap
 
 logger = logging.getLogger(__name__)
 
-def list_audio_files_s3(deployment_dir, audio_extensions=(".wav", ".flac", ".aif", ".aiff")):
-    """
-    List audio files in a deployment directory on S3.
 
-    Lists the contents of an S3 prefix and keeps only the entries whose
+def _get_fs(path):
+    """Return an fsspec-compatible filesystem for the given path."""
+    if path.startswith(("s3://", "s3a://")):
+        return s3fs.S3FileSystem()
+    return fsspec.filesystem("file")
+
+def list_audio_files(deployment_dir, audio_extensions=(".wav", ".flac", ".aif", ".aiff")):
+    """
+    List audio files in a deployment directory (S3 or local).
+
+    Lists the contents of a directory and keeps only the entries whose
     names end with one of the given audio extensions. Anything else
     (metadata files, logs, calibration files, subdirectories) is ignored.
 
     Parameters
     ----------
     deployment_dir : str
-        S3 path of the deployment directory, e.g.
-        "my-bucket/deployments/SB_2021_03". Non-recursive: only entries
-        directly under this prefix are returned.
+        Path of the deployment directory. Can be an S3 path (e.g.
+        "s3://my-bucket/deployments/SB_2021_03") or a local path (e.g.
+        "/data/deployments/SB_2021_03"). Non-recursive: only entries
+        directly under this directory are returned.
     audio_extensions : tuple of str, optional
         Extensions to keep, given in lowercase and including the leading
         dot. Matching is case-insensitive. Default is
@@ -36,37 +45,35 @@ def list_audio_files_s3(deployment_dir, audio_extensions=(".wav", ".flac", ".aif
     Returns
     -------
     list of str
-        Full S3 paths of the matching audio files, sorted. Empty if the
+        Full paths of the matching audio files, sorted. Empty if the
         directory contains no audio files.
-
-    Notes
-    -----
-    Uses anonymous or environment-based S3 credentials, whichever
-    `s3fs.S3FileSystem` picks up by default.
 
     Examples
     --------
-    >>> list_audio_files_s3("my-bucket/deployments/SB_2021_03")
+    >>> list_audio_files("s3://my-bucket/deployments/SB_2021_03")
     ['my-bucket/deployments/SB_2021_03/67416022.210310130000.wav', ...]
+    >>> list_audio_files("/data/deployments/SB_2021_03")
+    ['/data/deployments/SB_2021_03/67416022.210310130000.wav', ...]
     """
-    fs = s3fs.S3FileSystem()
+    fs = _get_fs(deployment_dir)
     return _filter_audio_files(fs.ls(deployment_dir), audio_extensions)
 
 
-def list_audio_folders_s3(root_dir, audio_extensions=(".wav", ".flac", ".aif", ".aiff"),
-                          min_files=1, maxdepth=None):
+def list_audio_folders(root_dir, audio_extensions=(".wav", ".flac", ".aif", ".aiff"),
+                       min_files=1, maxdepth=None):
     """
-    Find all folders containing audio files under an S3 prefix.
+    Find all folders containing audio files under a root directory (S3 or local).
 
-    Walks the directory tree below `root_dir` and calls
-    `list_audio_files_s3` on each folder. Folders holding at least
-    `min_files` audio files are kept. Intended as the entry point for
+    Walks the directory tree below `root_dir` and keeps folders holding
+    at least `min_files` audio files. Intended as the entry point for
     batch processing: each returned folder is treated as one deployment.
 
     Parameters
     ----------
     root_dir : str
-        S3 path to crawl, e.g. "s3://neracoos-pam-data-ingest/Wellfleet".
+        Path to crawl. Can be an S3 path (e.g.
+        "s3://neracoos-pam-data-ingest/Wellfleet") or a local path
+        (e.g. "/data/Wellfleet" or "D:\\Data\\Wellfleet").
     audio_extensions : tuple of str, optional
         Extensions to keep, given in lowercase and including the leading
         dot. Matching is case-insensitive. Default is
@@ -84,7 +91,7 @@ def list_audio_folders_s3(root_dir, audio_extensions=(".wav", ".flac", ".aif", "
     -------
     dict
         Maps folder path to the sorted list of audio files it contains,
-        as returned by `list_audio_files_s3`. Folders are in sorted
+        as returned by `list_audio_files`. Folders are in sorted
         order. Empty if no audio files are found under `root_dir`.
 
     Notes
@@ -97,17 +104,16 @@ def list_audio_folders_s3(root_dir, audio_extensions=(".wav", ".flac", ".aif", "
 
     Examples
     --------
-    >>> folders = list_audio_folders_s3("s3://my-bucket/Wellfleet")
+    >>> folders = list_audio_folders("s3://my-bucket/Wellfleet")
+    >>> folders = list_audio_folders("/data/Wellfleet")
     >>> for folder, audio_files in folders.items():
     ...     print(folder, len(audio_files))
     """
-    fs = s3fs.S3FileSystem()
+    fs = _get_fs(root_dir)
 
     folders = {}
-    with tqdm(desc="Walking S3", unit=" dirs", leave=True) as pbar:
+    with tqdm(desc="Walking directories", unit=" dirs", leave=True) as pbar:
         for folder, _dirs, files in fs.walk(root_dir, maxdepth=maxdepth):
-            # Reuse the filesystem and file list from the walk to avoid an extra
-            # ls() call and a new S3FileSystem object per folder.
             full_paths = [f"{folder}/{f}" for f in files]
             audio_files = _filter_audio_files(full_paths, audio_extensions)
             if len(audio_files) >= min_files:
@@ -174,7 +180,7 @@ def retrieve_recording_interval(audio_files):
         )
         return None
 
-    audio_files_datetime = filename_to_datetime([PurePosixPath(f).name for f in audio_files])
+    audio_files_datetime = filename_to_datetime([os.path.basename(f) for f in audio_files])
     times = sorted(t for t in audio_files_datetime if pd.notna(t))
 
     if len(times) < 2:
@@ -245,7 +251,7 @@ def retrieve_recorder_serial_number(audio_files, recorder_type="SoundTrap"):
 
     SN, unparsed = [], []
     for f in audio_files:
-        name = PurePosixPath(f).name
+        name = os.path.basename(f)
         candidate = name.split(".")[0]
         if candidate.isdigit():
             SN.append(candidate)
@@ -301,7 +307,7 @@ def summarize_audio_files_metadata(df, threshold=0.9):
     dict
         Keys 'recording_sample_rate_hz', 'recording_n_channels',
         'recording_bit_depth', 'recording_format', and
-        'recording_duration_sec', plus 'n_files' and 'n_errors'.
+        'recording_duration_sec', plus 'n_errors'.
 
     Logs
     ----
@@ -319,23 +325,24 @@ def summarize_audio_files_metadata(df, threshold=0.9):
     summary["recording_duration_sec"] = _dominant_value(
         ok["recording_duration_sec"].round(), "recording_duration_sec", threshold
     )
-    summary["n_files"] = len(df)
     summary["n_errors"] = n_errors
     return summary
 
 def retrieve_audio_files_metadata(audio_files, num_workers=16,
-                                  subsampling_fraction=None, min_sample=10):
+                                  subsampling_fraction=None, min_sample=10,
+                                  max_sample=20):
     """
-    Read sample rate, bit depth, and duration from audio files on S3.
+    Read sample rate, bit depth, and duration from audio files (S3 or local).
 
     Reads only file headers, so no audio data is transferred. Files are
-    read concurrently using a thread pool, which suits this workload
-    because it is dominated by network latency rather than computation.
+    read concurrently using a thread pool, which suits S3 workloads
+    (dominated by network latency) and helps with local disk I/O too.
 
     Parameters
     ----------
     audio_files : sequence of str
-        S3 paths of the audio files, as returned by `list_audio_files`.
+        Paths of the audio files, as returned by `list_audio_files`.
+        Can be S3 paths or local paths.
     num_workers : int, optional
         Number of concurrent header reads. Default is 16. Higher values
         tend to hit S3 throttling rather than improve throughput.
@@ -347,6 +354,12 @@ def retrieve_audio_files_metadata(audio_files, num_workers=16,
     min_sample : int, optional
         Minimum number of files to read regardless of `subsampling_fraction`.
         Prevents degenerate samples on small deployments. Default is 10.
+    max_sample : int or None, optional
+        Maximum number of files to read per folder. When set, the sample
+        size is capped at this value regardless of `subsampling_fraction`.
+        Reading 15–20 files is usually enough to detect inconsistencies
+        while keeping the header phase O(folders) instead of O(files).
+        Default is 20. Set to None to disable the cap.
 
     Returns
     -------
@@ -360,22 +373,30 @@ def retrieve_audio_files_metadata(audio_files, num_workers=16,
     audio_files = list(audio_files)
     n_total = len(audio_files)
 
+    # Determine sample size: start from fraction if given, then apply caps
+    n_sample = n_total
     if subsampling_fraction is not None and subsampling_fraction < 1.0:
         n_sample = max(min_sample, int(round(n_total * subsampling_fraction)))
-        n_sample = min(n_sample, n_total)  # can't sample more than we have
-        if n_sample < n_total:
-            audio_files = random.sample(audio_files, n_sample)
-            logger.info(
-                "Subsampling %d of %d files (%.0f%%) for metadata read.",
-                n_sample, n_total, n_sample / n_total * 100,
-            )
+    if max_sample is not None:
+        n_sample = min(n_sample, max_sample)
+    n_sample = min(n_sample, n_total)  # can't sample more than we have
+    if n_sample < n_total:
+        audio_files = random.sample(audio_files, n_sample)
+        logger.info(
+            "Subsampling %d of %d files (%.0f%%) for metadata read.",
+            n_sample, n_total, n_sample / n_total * 100,
+        )
 
-    fs = s3fs.S3FileSystem()
+    fs = _get_fs(audio_files[0])
+    use_s3_opts = isinstance(fs, s3fs.S3FileSystem)
 
     def read_one(path):
         try:
-            with fs.open(path, "rb") as f:
-                info = sf.info(f)
+            if use_s3_opts:
+                with fs.open(path, "rb", block_size=64 * 1024, cache_type="bytes") as f:
+                    info = sf.info(f)
+            else:
+                info = sf.info(path)
         except Exception as e:
             return {"path": path, "error": str(e)}
 
@@ -393,9 +414,9 @@ def retrieve_audio_files_metadata(audio_files, num_workers=16,
     rows = []
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = {executor.submit(read_one, path): path for path in audio_files}
-        folder_label = PurePosixPath(next(iter(audio_files))).parent.name
+        folder_label = os.path.basename(os.path.dirname(next(iter(audio_files))))
         desc = f"  {folder_label}"
-        if subsampling_fraction is not None and subsampling_fraction < 1.0 and len(audio_files) < n_total:
+        if len(audio_files) < n_total:
             desc += f" ({len(audio_files)}/{n_total})"
         with tqdm(
             total=len(audio_files),
@@ -645,12 +666,12 @@ class _WarningCollector(logging.Handler):
         self.messages = []
 
 
-def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
-                             files_num_workers=16,
-                             subsampling_fraction=None,
-                             recorder_type="SoundTrap", gain_type="High"):
+def scan_for_audio_metadata(root_dir, output_csv=None, min_files=1,
+                            files_num_workers=16,
+                            subsampling_fraction=None, max_sample=20,
+                            recorder_type="SoundTrap", gain_type="High"):
     """
-    Build a metadata catalogue for every deployment folder under an S3 prefix.
+    Build a metadata catalogue for every deployment folder under a root directory.
 
     Finds folders containing audio files, then extracts the recorder
     serial number, calibration gain, recording interval, and audio file
@@ -663,7 +684,9 @@ def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
     Parameters
     ----------
     root_dir : str
-        S3 path to crawl, e.g. "s3://neracoos-pam-data-ingest/Wellfleet".
+        Path to crawl. Can be an S3 path (e.g.
+        "s3://neracoos-pam-data-ingest/Wellfleet") or a local path
+        (e.g. "/data/Wellfleet" or "D:\\Data\\Wellfleet").
     output_csv : str or None, optional
         Path to save the resulting DataFrame as a CSV file. If None, no
         file is written. Default is None.
@@ -671,7 +694,7 @@ def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
         Minimum number of audio files a folder must contain to be
         included. Default is 1.
     files_num_workers : int, optional
-        Number of concurrent S3 header reads per folder. Default is 16.
+        Number of concurrent header reads per folder. Default is 16.
         Higher values tend to hit S3 throttling rather than improve speed.
     subsampling_fraction : float or None, optional
         Fraction of files to read per folder (0.0–1.0). If None, all
@@ -679,6 +702,9 @@ def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
         settings are constant and reading every header is wasteful.
         Passed through to `retrieve_audio_files_metadata`. Default is
         None.
+    max_sample : int or None, optional
+        Maximum number of files to read per folder, regardless of
+        `subsampling_fraction`. Default is 20. Set to None to disable.
     recorder_type : str, optional
         Recorder type, used for serial number parsing and calibration
         lookup. Only "SoundTrap" is currently supported. Default is
@@ -699,7 +725,7 @@ def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
         folder, regardless of sampling. Folders that failed have the
         reason in 'error' and NaN elsewhere.
     """
-    folders = list_audio_folders_s3(root_dir, min_files=min_files)
+    folders = list_audio_folders(root_dir, min_files=min_files)
 
     if not folders:
         return pd.DataFrame(columns=["folder", "n_files", "error"])
@@ -708,7 +734,6 @@ def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
     rows = []
     already_scanned = set()
     if output_csv is not None:
-        import os
         if os.path.exists(output_csv):
             previous = pd.read_csv(output_csv)
             already_scanned = set(previous["folder"])
@@ -725,7 +750,7 @@ def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
         for folder, audio_files in folders.items():
             if folder in already_scanned:
                 continue
-            pbar.set_postfix_str(PurePosixPath(folder).name, refresh=True)
+            pbar.set_postfix_str(os.path.basename(folder), refresh=True)
             warning_collector.clear()
             row = {"folder": folder, "n_files": len(audio_files), "error": None}
             try:
@@ -746,7 +771,7 @@ def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
                 # Extract start and end datetimes from file names
                 times = sorted(
                     t for t in filename_to_datetime(
-                        [PurePosixPath(f).name for f in audio_files]
+                        [os.path.basename(f) for f in audio_files]
                     )
                     if pd.notna(t)
                 )
@@ -756,6 +781,7 @@ def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
                 metadata = retrieve_audio_files_metadata(
                     audio_files, num_workers=files_num_workers,
                     subsampling_fraction=subsampling_fraction,
+                    max_sample=max_sample,
                 )
                 row.update(summarize_audio_files_metadata(metadata))
             except Exception as e:
@@ -778,6 +804,12 @@ def scan_bucket_for_audio_metadata(root_dir, output_csv=None, min_files=1,
     return df
 
 
+# Backward-compatible aliases for the old S3-only names
+list_audio_files_s3 = list_audio_files
+list_audio_folders_s3 = list_audio_folders
+scan_bucket_for_audio_metadata = scan_for_audio_metadata
+
+
 if __name__ == "__main__":
     import datetime
     log_file = f"s3_metadata_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -790,13 +822,14 @@ if __name__ == "__main__":
         ],
     )
 
-    deployment_dir = "s3://neracoos-pam-data-ingest/Wellfleet/Wellfleet (1) April 22 2014 - May 21 2014/"
+    deployment_dir = "s3://neracoos-pam-data-ingest/Wellfleet"
     output_csv = "s3://neracoos-pam-output/tests_xavier/wellfleet_metadata.csv"
 
-    df = scan_bucket_for_audio_metadata(deployment_dir,
+    df = scan_for_audio_metadata(deployment_dir,
                                   min_files=1,
                                   files_num_workers=32,
                                   subsampling_fraction=0.3,
+                                  max_sample=30,
                                   recorder_type="SoundTrap",
                                   gain_type="High",
                                   output_csv=output_csv)

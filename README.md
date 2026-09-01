@@ -4,6 +4,53 @@ Scripts and tools for the PAMHub cloud platform.
 
 ---
 
+## Setup
+
+**Requirements:** Python 3.10 or later.
+
+1. Clone the repository:
+
+```bash
+git clone https://github.com/xaviermouy/PAMHub_tools.git
+cd PAMHub_tools
+```
+
+2. (Recommended) Create and activate a virtual environment:
+
+```bash
+python -m venv venv
+
+# Linux / macOS
+source venv/bin/activate
+
+# Windows
+venv\Scripts\activate
+```
+
+3. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+4. Run scripts from the `scripts/` directory:
+
+```bash
+cd scripts
+python acoustic_metadata_scanner.py
+```
+
+Or import functions directly in your own code or Jupyter notebooks:
+
+```python
+import sys
+sys.path.insert(0, "/path/to/PAMHub_tools/scripts")
+
+from acoustic_metadata_scanner import scan_for_audio_metadata
+```
+
+---
+
 ## Scripts
 
 ### `audio_qc_basics_UI.py` — Audio QC Web App
@@ -33,10 +80,11 @@ This produces two files that must be deployed together:
 
 ---
 
-### `s3_acoustic_metadata_scanner.py` — S3 Audio Metadata Scanner
+### `acoustic_metadata_scanner.py` — Audio Metadata Scanner
 
-Scans an S3 bucket for audio files (WAV, FLAC, AIF) and builds a metadata
-catalogue with one row per deployment folder. For each folder it extracts:
+Scans a directory tree (S3 bucket or local folder) for audio files (WAV,
+FLAC, AIF) and builds a metadata catalogue with one row per deployment
+folder. For each folder it extracts:
 
 - **Recorder info**: serial number, model (auto-detected from the Ocean
   Instruments database), gain type, and end-to-end system gain (sysgain)
@@ -44,16 +92,16 @@ catalogue with one row per deployment folder. For each folder it extracts:
   duration
 - **Audio properties**: sample rate, bit depth, number of channels, format
 
-The main entry point is `scan_bucket_for_audio_metadata()`.
+The main entry point is `scan_for_audio_metadata()`.
 
 **Parameters:**
 
 | Parameter | Default | Description |
 |---|---|---|
-| `root_dir` | *(required)* | S3 path to crawl, e.g. `"s3://my-bucket/Wellfleet"` |
+| `root_dir` | *(required)* | Path to crawl — S3 (e.g. `"s3://my-bucket/Wellfleet"`) or local (e.g. `"/data/Wellfleet"`, `"D:\Data\Wellfleet"`) |
 | `output_csv` | `None` | Path to save results as CSV. `None` = no file written. Supports resume: if the CSV already exists, previously scanned folders are skipped |
 | `min_files` | `1` | Minimum audio files for a folder to be included |
-| `files_num_workers` | `16` | Concurrent S3 header reads per folder |
+| `files_num_workers` | `16` | Concurrent header reads per folder |
 | `subsampling_fraction` | `None` | Fraction of files to read (0.0–1.0). `None` = all files (still subject to `max_sample` cap) |
 | `max_sample` | `20` | Maximum number of files to read per folder. Caps the sample regardless of `subsampling_fraction`. Set to `None` to disable |
 | `recorder_type` | `"SoundTrap"` | Recorder type for filename parsing. Only `"SoundTrap"` currently supported |
@@ -68,7 +116,7 @@ The main entry point is `scan_bucket_for_audio_metadata()`.
 `recording_format`, `recording_duration_sec`, `n_errors`, `error`,
 `warnings`
 
-**Example usage (Jupyter notebook on Nebari):**
+**Example usage — S3 (Jupyter notebook on Nebari):**
 
 ```python
 import logging
@@ -77,10 +125,10 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(message)s",
 )
 
-from s3_acoustic_metadata_scanner import scan_bucket_for_audio_metadata
+from acoustic_metadata_scanner import scan_for_audio_metadata
 
-# Scan all deployments under a site, reading up to 20 file headers per folder
-df = scan_bucket_for_audio_metadata(
+# Scan all deployments under a site on S3
+df = scan_for_audio_metadata(
     "s3://neracoos-pam-data-ingest/Wellfleet",
     output_csv="wellfleet_metadata.csv",
     max_sample=20,
@@ -90,8 +138,21 @@ df = scan_bucket_for_audio_metadata(
 df
 ```
 
-**Dependencies:** `s3fs`, `soundfile`, `pandas`, `tqdm`, `requests`,
-`pyhydrophone`, `ecosound`
+**Example usage — local folder (Windows or Linux):**
+
+```python
+from acoustic_metadata_scanner import scan_for_audio_metadata
+
+# Scan deployments stored locally
+df = scan_for_audio_metadata(
+    r"D:\Data\Wellfleet",
+    output_csv="wellfleet_metadata.csv",
+    max_sample=20,
+)
+```
+
+**Dependencies:** `fsspec`, `s3fs`, `soundfile`, `pandas`, `tqdm`,
+`requests`, `pyhydrophone`, `ecosound`
 
 ---
 
