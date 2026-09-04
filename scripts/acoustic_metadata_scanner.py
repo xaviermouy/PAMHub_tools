@@ -16,32 +16,6 @@ from pyhydrophone.soundtrap import SoundTrap
 logger = logging.getLogger(__name__)
 
 
-def _safe_filename_to_datetime(filenames):
-    """Wrapper around filename_to_datetime that skips unparseable names.
-
-    Returns a list of datetime objects (or None for failures). Logs a
-    single warning listing any filenames that could not be parsed.
-    """
-    timestamps = []
-    bad_files = []
-    for f in filenames:
-        try:
-            ts = filename_to_datetime([f])[0]
-            timestamps.append(ts)
-        except (ValueError, TypeError):
-            timestamps.append(None)
-            bad_files.append(f)
-    if bad_files:
-        logger.warning(
-            "%d of %d filenames had unrecognized timestamps and were "
-            "skipped: %s",
-            len(bad_files), len(filenames),
-            ", ".join(bad_files[:10])
-            + (" ..." if len(bad_files) > 10 else ""),
-        )
-    return timestamps
-
-
 def _get_fs(path):
     """Return an fsspec-compatible filesystem for the given path."""
     if path.startswith(("s3://", "s3a://")):
@@ -206,7 +180,7 @@ def retrieve_recording_interval(audio_files):
         )
         return None
 
-    audio_files_datetime = _safe_filename_to_datetime([os.path.basename(f) for f in audio_files])
+    audio_files_datetime = filename_to_datetime([os.path.basename(f) for f in audio_files])
     times = sorted(t for t in audio_files_datetime if pd.notna(t))
 
     if len(times) < 2:
@@ -604,35 +578,6 @@ def lookup_soundtrap_sysgain(serial_number, gain_type="High", model="ST300HF"):
         )
         return None
 
-    # Check if multiple calibration records exist for this device
-    try:
-        search_url = (
-            "http://oceaninstruments.azurewebsites.net/api/Devices/Search/%s"
-            % serial_number
-        )
-        devices = requests.get(search_url).json()
-        device_id = devices[0]["deviceId"]
-        cal_url = (
-            "http://oceaninstruments.azurewebsites.net/api/Calibrations/Device/%s"
-            % device_id
-        )
-        calibrations = requests.get(cal_url).json()
-        if len(calibrations) > 1:
-            dates = sorted(set(c["dateCreated"][:10] for c in calibrations))
-            gain_key = "highFreq" if gain_type == "High" else "lowFreq"
-            values = sorted(set(c[gain_key] for c in calibrations))
-            logger.warning(
-                "Serial %s has %d calibration records (dates: %s; %s gain "
-                "values: %s). Using the most recent (sysgain=%.1f).",
-                serial_number, len(calibrations), ", ".join(dates),
-                gain_type, ", ".join(str(v) for v in values), sysgain,
-            )
-    except Exception as e:
-        logger.warning(
-            "Could not check for multiple calibrations for serial %s: %s: %s",
-            serial_number, type(e).__name__, e,
-        )
-
     _sysgain_cache[cache_key] = sysgain
     return sysgain
 
@@ -825,7 +770,7 @@ def scan_for_audio_metadata(root_dir, output_csv=None, min_files=1,
 
                 # Extract start and end datetimes from file names
                 times = sorted(
-                    t for t in _safe_filename_to_datetime(
+                    t for t in filename_to_datetime(
                         [os.path.basename(f) for f in audio_files]
                     )
                     if pd.notna(t)
@@ -852,20 +797,8 @@ def scan_for_audio_metadata(root_dir, output_csv=None, min_files=1,
     logger.removeHandler(warning_collector)
 
     df = pd.DataFrame(rows)
-    if "recording_start_datetime" in df.columns:
-        df.sort_values("recording_start_datetime", na_position="last", inplace=True)
-        df.reset_index(drop=True, inplace=True)
-
-    # Place 'warnings' right after 'error'
-    if "warnings" in df.columns and "error" in df.columns:
-        cols = list(df.columns)
-        cols.remove("warnings")
-        error_idx = cols.index("error")
-        cols.insert(error_idx + 1, "warnings")
-        df = df[cols]
 
     if output_csv is not None:
-        df.to_csv(output_csv, index=False)
         print(f"\nMetadata saved to {output_csv}")
 
     return df
