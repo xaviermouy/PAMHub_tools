@@ -344,18 +344,6 @@ def summarize_audio_files_metadata(df, threshold=0.9):
     n_errors = int(df["error"].notna().sum()) if "error" in df else 0
     ok = df[df["error"].isna()] if "error" in df else df
 
-    metadata_fields = ("recording_sample_rate_hz", "recording_n_channels",
-                       "recording_bit_depth", "recording_format",
-                       "recording_duration_sec")
-    if ok.empty or not all(f in ok.columns for f in metadata_fields):
-        logger.warning(
-            "All %d sampled files failed to read; no metadata available.",
-            len(df),
-        )
-        summary = {field: None for field in metadata_fields}
-        summary["n_errors"] = n_errors
-        return summary
-
     summary = {
         field: _dominant_value(ok[field], field, threshold)
         for field in ("recording_sample_rate_hz", "recording_n_channels", "recording_bit_depth", "recording_format")
